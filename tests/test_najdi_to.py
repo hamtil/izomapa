@@ -12,6 +12,7 @@ class TestNajdiTo(unittest.TestCase):
         self.assertTrue(php_adapter.exists(), "priklady/najdi_to.php musí existovat")
         php_content = php_adapter.read_text(encoding='utf-8')
         self.assertIn('ip_address', php_content)
+        self.assertIn('ip_hash', php_content)
         self.assertIn('level_complete', php_content)
         self.assertIn('getClientIp', php_content)
         self.assertNotIn('admin123', php_content, "Žádný výchozí heslo nesmí být natvrdo v kódu")

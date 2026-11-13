@@ -2,13 +2,20 @@
 /**
  * Volitelný backend adaptér pro ukládání výsledků hry "Najdeš to?" do SQLite.
  *
+ * Ochrana soukromí (GDPR):
+ * - Skript NEUKLÁDÁ surové IP adresy hráčů do databáze.
+ * - Pro detekci podvodů (opakované pokusy z anonymních oken) se z IP adresy a tajné soli
+ *   počítá jednosměrný kryptografický hash (SHA-256). Z hashe nelze zpětně zjistit IP adresu
+ *   ani identitu osoby (anonymizace dle GDPR).
+ * - Podrobné mezikroky úrovní se automaticky rotačně promazávají po 14 dnech (minimalizace údajů).
+ *
  * Podporuje:
  * - POST:
- *     - action: 'level_complete': zaznamenání splnění dílčí úrovně (čas, pokus, IP)
- *     - action: 'game_complete' (nebo výchozí): finální uložení celé hry (nick, časy, pokus, IP)
+ *     - action: 'level_complete': zaznamenání splnění dílčí úrovně (čas, pokus, hash)
+ *     - action: 'game_complete' (nebo výchozí): finální uložení celé hry (nick, časy, pokus, hash)
  * - GET:
  *     - výchozí: bezpečný veřejný žebříček nejlepších časů (bez citlivých údajů)
- *     - ?audit=1: interní přehled všech záznamů a IP adres pro autora (kontrola podvodů/anonymních oken)
+ *     - ?audit=1: interní přehled všech záznamů a hashů pro autora (kontrola podvodů/anonymních oken)
  */
 
 declare(strict_types=1);
@@ -44,7 +51,6 @@ if (file_exists(__DIR__ . '/config.php')) {
     }
 }
 $adminKey = (string)(getenv('NAJDI_TO_ADMIN_KEY') ?: ($localConfig['admin_key'] ?? ''));
-$salt = (string)($localConfig['salt'] ?? 'izo_salt');
 
 // Cesta k databázi SQLite
 $dbDir = __DIR__ . '/data';
@@ -55,6 +61,17 @@ if (!file_exists($dbDir . '/.htaccess')) {
     @file_put_contents($dbDir . '/.htaccess', "Require all denied\nDeny from all\n");
 }
 $dbPath = $dbDir . '/najdi_to.sqlite';
+
+// Inicializace tajné soli pro hashování (pokud není v config.php, vytvoří se náhodná per-instance sůl)
+$saltFile = $dbDir . '/.salt';
+if (empty($localConfig['salt'])) {
+    if (!file_exists($saltFile)) {
+        @file_put_contents($saltFile, bin2hex(random_bytes(16)));
+    }
+    $salt = (string)(@file_get_contents($saltFile) ?: 'izo_default_salt');
+} else {
+    $salt = (string)$localConfig['salt'];
+}
 
 try {
     $pdo = new PDO('sqlite:' . $dbPath);
@@ -73,13 +90,13 @@ try {
             attempt INTEGER DEFAULT 1,
             location TEXT DEFAULT '',
             levels_json TEXT,
-            ip_address TEXT,
+            ip_address TEXT DEFAULT NULL,
             ip_hash TEXT,
             user_agent TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_total_time ON najdi_to_scores(total_time);
         CREATE INDEX IF NOT EXISTS idx_location ON najdi_to_scores(location);
-        CREATE INDEX IF NOT EXISTS idx_ip ON najdi_to_scores(ip_address);
+        CREATE INDEX IF NOT EXISTS idx_hash ON najdi_to_scores(ip_hash);
 
         CREATE TABLE IF NOT EXISTS najdi_to_level_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,21 +110,29 @@ try {
             attempt INTEGER DEFAULT 1,
             location TEXT DEFAULT '',
             nick TEXT DEFAULT '',
-            ip_address TEXT,
+            ip_address TEXT DEFAULT NULL,
             ip_hash TEXT,
             user_agent TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_log_created ON najdi_to_level_logs(created_at);
-        CREATE INDEX IF NOT EXISTS idx_log_ip ON najdi_to_level_logs(ip_address);
+        CREATE INDEX IF NOT EXISTS idx_log_hash ON najdi_to_level_logs(ip_hash);
         CREATE INDEX IF NOT EXISTS idx_log_session ON najdi_to_level_logs(session_id);
     ");
 
     // Doplnění chybějících sloupců do existující tabulky najdi_to_scores
     $existingCols = $pdo->query("PRAGMA table_info(najdi_to_scores)")->fetchAll(PDO::FETCH_COLUMN, 1);
-    foreach (['session_id', 'ip_address', 'user_agent'] as $col) {
+    foreach (['session_id', 'ip_address', 'ip_hash', 'user_agent'] as $col) {
         if (!in_array($col, $existingCols, true)) {
             $pdo->exec("ALTER TABLE najdi_to_scores ADD COLUMN {$col} TEXT DEFAULT ''");
         }
+    }
+
+    // Retroaktivní anonymizace dřívějších IP adres v existující databázi (GDPR)
+    try {
+        $pdo->exec("UPDATE najdi_to_scores SET ip_address = NULL WHERE ip_address IS NOT NULL;");
+        $pdo->exec("UPDATE najdi_to_level_logs SET ip_address = NULL WHERE ip_address IS NOT NULL;");
+    } catch (Exception $e) {
+        // Ignorovat, pokud sloupce ještě neexistují
     }
 } catch (Exception $e) {
     http_response_code(500);
@@ -137,7 +162,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             }
 
             $stmt = $pdo->query("
-                SELECT id, created_at, session_id, event, lvl, level_time, total_time, difficulty, attempt, location, nick, ip_address, user_agent
+                SELECT id, created_at, session_id, event, lvl, level_time, total_time, difficulty, attempt, location, nick, ip_hash, user_agent
                 FROM najdi_to_level_logs
                 ORDER BY id DESC
                 LIMIT 100
@@ -146,7 +171,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET') {
             exit;
         }
 
-        // Veřejný žebříček (bez IP a uživatelských agentů)
+        // Veřejný žebříček (bez hashů a uživatelských agentů)
         $location = trim($_GET['location'] ?? '');
         $limit = min(50, max(1, (int)($_GET['limit'] ?? 20)));
 
@@ -192,6 +217,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // Automatické rotační čištění auditních logů starších než 14 dní (minimalizace dat dle GDPR)
+    try {
+        $pdo->exec("DELETE FROM najdi_to_level_logs WHERE created_at < datetime('now', '-14 days')");
+    } catch (Exception $e) {
+        // Tichá ignorace
+    }
+
     $ip = getClientIp();
     $ipHash = $ip !== '' ? hash('sha256', $ip . '_' . $salt) : null;
     $userAgent = mb_substr(trim($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 255, 'UTF-8');
@@ -211,7 +243,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $stmt = $pdo->prepare("
                 INSERT INTO najdi_to_level_logs (session_id, event, lvl, level_time, total_time, difficulty, attempt, location, nick, ip_address, ip_hash, user_agent)
-                VALUES (:session_id, 'level_complete', :lvl, :level_time, :total_time, :diff, :attempt, :loc, :nick, :ip_address, :ip_hash, :ua)
+                VALUES (:session_id, 'level_complete', :lvl, :level_time, :total_time, :diff, :attempt, :loc, :nick, NULL, :ip_hash, :ua)
             ");
             $stmt->execute([
                 ':session_id' => $sessionId,
@@ -222,7 +254,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ':attempt' => $attempt,
                 ':loc' => $location,
                 ':nick' => $nick,
-                ':ip_address' => $ip,
                 ':ip_hash' => $ipHash,
                 ':ua' => $userAgent,
             ]);
@@ -248,7 +279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         $stmt = $pdo->prepare("
             INSERT INTO najdi_to_scores (session_id, nick, total_time, difficulty, attempt, location, levels_json, ip_address, ip_hash, user_agent)
-            VALUES (:session_id, :nick, :total_time, :diff, :attempt, :loc, :levels, :ip_address, :ip_hash, :ua)
+            VALUES (:session_id, :nick, :total_time, :diff, :attempt, :loc, :levels, NULL, :ip_hash, :ua)
         ");
         $stmt->execute([
             ':session_id' => $sessionId,
@@ -258,7 +289,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ':attempt' => $attempt,
             ':loc' => $location,
             ':levels' => $levelsJson,
-            ':ip_address' => $ip,
             ':ip_hash' => $ipHash,
             ':ua' => $userAgent,
         ]);
@@ -268,7 +298,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Zápis finálního dokončení do auditního logu
         $logStmt = $pdo->prepare("
             INSERT INTO najdi_to_level_logs (session_id, event, lvl, level_time, total_time, difficulty, attempt, location, nick, ip_address, ip_hash, user_agent)
-            VALUES (:session_id, 'game_complete', 0, 0, :total_time, :diff, :attempt, :loc, :nick, :ip_address, :ip_hash, :ua)
+            VALUES (:session_id, 'game_complete', 0, 0, :total_time, :diff, :attempt, :loc, :nick, NULL, :ip_hash, :ua)
         ");
         $logStmt->execute([
             ':session_id' => $sessionId,
@@ -277,7 +307,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ':attempt' => $attempt,
             ':loc' => $location,
             ':nick' => $nick,
-            ':ip_address' => $ip,
             ':ip_hash' => $ipHash,
             ':ua' => $userAgent,
         ]);
